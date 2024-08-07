@@ -133,6 +133,64 @@ func main() {
 }
 ```
 
+Also you might want to use Enums in your structs and have models for them on frontend. In that case you should create array that will contain all possible enum values, instrument enum type and bind it to the app:
+
+```go {16-18} title="app.go"
+type Weekday string
+
+const (
+    Sunday    Weekday = "Sunday"
+    Monday    Weekday = "Monday"
+    Tuesday   Weekday = "Tuesday"
+    Wednesday Weekday = "Wednesday"
+    Thursday  Weekday = "Thursday"
+    Friday    Weekday = "Friday"
+    Saturday  Weekday = "Saturday"
+)
+
+var AllWeekdays = []struct {
+    Value  Weekday
+    TSName string
+}{
+    {Sunday, "SUNDAY"},
+    {Monday, "MONDAY"},
+    {Tuesday, "TUESDAY"},
+    {Wednesday, "WEDNESDAY"},
+    {Thursday, "THURSDAY"},
+    {Friday, "FRIDAY"},
+    {Saturday, "SATURDAY"},
+}
+```
+
+In the main application configuration, the `EnumBind` key is where we can tell Wails what we want to bind enums as well:
+
+```go {11-13} title="main.go"
+func main() {
+
+    app := NewApp()
+
+    err := wails.Run(&options.App{
+        Title:             "My App",
+        Width:             800,
+        Height:            600,
+        OnStartup:  app.startup,
+        OnShutdown: app.shutdown,
+    Bind: []interface{}{
+        app,
+    },
+    EnumBind: []interface{}{
+        AllWeekdays,
+     },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+
+```
+
+This will add missing enums to your `model.ts` file.
+
 Mais informações sobre isso podem ser encontradas [aqui](../howdoesitwork.mdx#method-binding).
 
 ## Menu da aplicação
@@ -187,7 +245,28 @@ O servidor de desenvolvimento utiliza uma técnica chamada "debwaring" que signi
 
 ## Servidor de Desenvolvedor Externo
 
-Alguns frameworks vêm com seu próprio servidor ao vivo, no entanto, eles não serão capazes de tirar proveito das ligações Go/Wails. Neste cenário, é melhor executar um script de observador que reconstrui o projeto no diretório build, que Wails estará assistindo. Por exemplo, veja o modelo padrão do svelte que usa [rollup](https://rollupjs.org/guide/en/). Para [create-react-app](https://create-react-app.dev/), é possível usar [este script](https://gist.github.com/int128/e0cdec598c5b3db728ff35758abdbafd) para alcançar um resultado similar.
+Alguns frameworks vêm com seu próprio servidor ao vivo, no entanto, eles não serão capazes de tirar proveito das ligações Go/Wails. Neste cenário, é melhor executar um script de observador que reconstrui o projeto no diretório build, que Wails estará assistindo. Por exemplo, veja o modelo padrão do svelte que usa [rollup](https://rollupjs.org/guide/en/).
+
+### Criar Aplicativo React
+
+O processo para um projeto Create-React-App é um pouco mais complicado. Para ajudar o frontend a recarregar ao vivo a seguinte configuração precisa ser adicionado ao seu `wails.json`:
+
+```json
+  "frontend:dev:watcher": "yarn start",
+  "frontend:dev:serverUrl": "http://localhost:3000",
+```
+
+O comando `frontend: dev:watcher` iniciará o servidor de desenvolvimento Create-React-App (hospedado na porta `3000` normalmente). O comando `frontend: dev:serverUrl` e instrui a Wails a servir assets do servidor de desenvolvimento ao carregar o frontend em vez de a partir da pasta de compilação. Além do acima acima o `index.html` precisa ser atualizado com o seguinte:
+
+```html
+    <head>
+        <meta name="wails-options" content="noautoinject" />
+        <script src="/wails/ipc.js"></script>
+        <script src="/wails/runtime.js"></script>
+    </head>
+```
+
+Isso é necessário pois o comando do observador que reconstrui o frontend impede que o Wails injete os scripts necessários. Isso contorna esse problema garantindo os scripts são sempre injetados. Com esta configuração, `ondas de desenvolvimento` pode ser executado, o que irá construir adequadamente o frontend e o backend com o carregamento de quente ativado. Além disso, ao acessar o aplicativo a partir de um navegador, as ferramentas de desenvolvedor do React agora podem ser usadas em uma versão não minificada do aplicativo para simplificar depuração. Finalmente, para compilações mais rápidas, `wail dev -s` pode ser executado para ignorar o edifício padrão do frontend pelas Wails, pois este é um passo desnecessário.
 
 ## Go Module
 

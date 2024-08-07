@@ -2,6 +2,8 @@ name: Sync Translations
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
 
 jobs:
   sync-translated-documents:
@@ -13,7 +15,7 @@ jobs:
       - name: Setup Nodejs
         uses: actions/setup-node@v2
         with:
-          node-version: 18.x
+          node-version: 20.x
 
       - name: Install Task
         uses: arduino/setup-task@v1

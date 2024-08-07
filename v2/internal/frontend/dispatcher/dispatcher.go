@@ -2,11 +2,11 @@ package dispatcher
 
 import (
 	"context"
-
 	"github.com/pkg/errors"
 	"github.com/wailsapp/wails/v2/internal/binding"
 	"github.com/wailsapp/wails/v2/internal/frontend"
 	"github.com/wailsapp/wails/v2/internal/logger"
+	"github.com/wailsapp/wails/v2/pkg/options"
 )
 
 type Dispatcher struct {
@@ -15,15 +15,17 @@ type Dispatcher struct {
 	events     frontend.Events
 	bindingsDB *binding.DB
 	ctx        context.Context
+	errfmt     options.ErrorFormatter
 }
 
-func NewDispatcher(ctx context.Context, log *logger.Logger, bindings *binding.Bindings, events frontend.Events) *Dispatcher {
+func NewDispatcher(ctx context.Context, log *logger.Logger, bindings *binding.Bindings, events frontend.Events, errfmt options.ErrorFormatter) *Dispatcher {
 	return &Dispatcher{
 		log:        log,
 		bindings:   bindings,
 		events:     events,
 		bindingsDB: bindings.DB(),
 		ctx:        ctx,
+		errfmt:     errfmt,
 	}
 }
 
@@ -44,6 +46,8 @@ func (d *Dispatcher) ProcessMessage(message string, sender frontend.Frontend) (s
 		return d.processWindowMessage(message, sender)
 	case 'B':
 		return d.processBrowserMessage(message, sender)
+	case 'D':
+		return d.processDragAndDropMessage(message)
 	case 'Q':
 		sender.Quit()
 		return "", nil

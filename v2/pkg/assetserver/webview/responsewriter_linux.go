@@ -4,7 +4,9 @@
 package webview
 
 /*
-#cgo linux pkg-config: gtk+-3.0 webkit2gtk-4.0 gio-unix-2.0
+#cgo linux pkg-config: gtk+-3.0 gio-unix-2.0
+#cgo !webkit2_41 pkg-config: webkit2gtk-4.0
+#cgo webkit2_41 pkg-config: webkit2gtk-4.1
 
 #include "gtk/gtk.h"
 #include "webkit2/webkit2.h"
@@ -84,18 +86,19 @@ func (rw *responseWriter) WriteHeader(code int) {
 	}
 }
 
-func (rw *responseWriter) Finish() {
+func (rw *responseWriter) Finish() error {
 	if !rw.wroteHeader {
 		rw.WriteHeader(http.StatusNotImplemented)
 	}
 
 	if rw.finished {
-		return
+		return nil
 	}
 	rw.finished = true
 	if rw.w != nil {
 		rw.w.Close()
 	}
+	return nil
 }
 
 func (rw *responseWriter) finishWithError(code int, err error) {

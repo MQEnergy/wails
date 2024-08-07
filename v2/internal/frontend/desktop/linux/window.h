@@ -55,6 +55,8 @@ typedef struct RGBAOptions
     uint8_t b;
     uint8_t a;
     void *webview;
+    void *webviewBox;
+    gboolean windowIsTranslucent;
 } RGBAOptions;
 
 typedef struct SetTitleArgs
@@ -104,7 +106,7 @@ gboolean Fullscreen(gpointer data);
 gboolean UnFullscreen(gpointer data);
 
 // WebView
-GtkWidget *SetupWebview(void *contentManager, GtkWindow *window, int hideWindowOnClose, int gpuPolicy);
+GtkWidget *SetupWebview(void *contentManager, GtkWindow *window, int hideWindowOnClose, int gpuPolicy, int disableWebViewDragAndDrop, int enableDragAndDrop);
 void LoadIndex(void *webview, char *url);
 void DevtoolsEnabled(void *webview, int enabled, bool showInspector);
 void ExecuteJS(void *data);
@@ -117,5 +119,10 @@ void StartResize(void *webview, GtkWindow *mainwindow, GdkWindowEdge edge);
 void MessageDialog(void *data);
 GtkFileFilter **AllocFileFilterArray(size_t ln);
 void Opendialog(void *data);
+
+// Inspector
+void sendShowInspectorMessage();
+void ShowInspector(void *webview);
+void InstallF12Hotkey(void *window);
 
 #endif /* window_h */

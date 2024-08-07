@@ -4,7 +4,10 @@
 package linux
 
 /*
-#cgo linux pkg-config: gtk+-3.0 webkit2gtk-4.0
+#cgo linux pkg-config: gtk+-3.0 
+#cgo !webkit2_41 pkg-config: webkit2gtk-4.0
+#cgo webkit2_41 pkg-config: webkit2gtk-4.1
+
 
 #include "gtk/gtk.h"
 
@@ -81,7 +84,8 @@ func parseKey(key string) C.guint {
 		return result
 	}
 	// Check for unknown namedkeys
-	if len(key) > 1 {
+	// Check if we only have a single character
+	if len(key) != 1 {
 		return C.guint(0)
 	}
 	keyval := rune(key[0])

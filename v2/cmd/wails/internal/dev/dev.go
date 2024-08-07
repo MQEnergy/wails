@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -51,7 +52,6 @@ func sliceToMap(input []string) map[string]struct{} {
 
 // Application runs the application in dev mode
 func Application(f *flags.Dev, logger *clilogger.CLILogger) error {
-
 	cwd := lo.Must(os.Getwd())
 
 	// Update go.mod to use current wails version
@@ -60,10 +60,12 @@ func Application(f *flags.Dev, logger *clilogger.CLILogger) error {
 		return err
 	}
 
-	// Run go mod tidy to ensure we're up-to-date
-	err = runCommand(cwd, false, "go", "mod", "tidy")
-	if err != nil {
-		return err
+	if !f.SkipModTidy {
+		// Run go mod tidy to ensure we're up-to-date
+		err = runCommand(cwd, false, f.Compiler, "mod", "tidy")
+		if err != nil {
+			return err
+		}
 	}
 
 	buildOptions := f.GenerateBuildOptions()
@@ -80,7 +82,7 @@ func Application(f *flags.Dev, logger *clilogger.CLILogger) error {
 
 	// Setup signal handler
 	quitChannel := make(chan os.Signal, 1)
-	signal.Notify(quitChannel, os.Interrupt, os.Kill, syscall.SIGTERM)
+	signal.Notify(quitChannel, os.Interrupt, syscall.SIGTERM)
 	exitCodeChannel := make(chan int, 1)
 
 	// Build the frontend if requested, but ignore building the application itself.
@@ -138,20 +140,6 @@ func Application(f *flags.Dev, logger *clilogger.CLILogger) error {
 		}
 	}
 
-	// create the project files watcher
-	watcher, err := initialiseWatcher(cwd)
-	if err != nil {
-		return err
-	}
-
-	defer func(watcher *fsnotify.Watcher) {
-		err := watcher.Close()
-		if err != nil {
-			logger.Fatal(err.Error())
-		}
-	}(watcher)
-
-	logutils.LogGreen("Watching (sub)/directory: %s", cwd)
 	logutils.LogGreen("Using DevServer URL: %s", f.DevServerURL())
 	if f.FrontendDevServerURL != "" {
 		logutils.LogGreen("Using Frontend DevServer URL: %s", f.FrontendDevServerURL)
@@ -165,7 +153,10 @@ func Application(f *flags.Dev, logger *clilogger.CLILogger) error {
 	}()
 
 	// Watch for changes and trigger restartApp()
-	debugBinaryProcess = doWatcherLoop(buildOptions, debugBinaryProcess, f, watcher, exitCodeChannel, quitChannel, f.DevServerURL(), legacyUseDevServerInsteadofCustomScheme)
+	debugBinaryProcess, err = doWatcherLoop(cwd, buildOptions, debugBinaryProcess, f, exitCodeChannel, quitChannel, f.DevServerURL(), legacyUseDevServerInsteadofCustomScheme)
+	if err != nil {
+		return err
+	}
 
 	// Kill the current program if running and remove dev binary
 	if err := killProcessAndCleanupBinary(debugBinaryProcess, appBinary); err != nil {
@@ -255,8 +246,8 @@ func runFrontendDevWatcherCommand(frontendDirectory string, devCommand string, d
 
 	const (
 		stateRunning   int32 = 0
-		stateCanceling       = 1
-		stateStopped         = 2
+		stateCanceling int32 = 1
+		stateStopped   int32 = 2
 	)
 	state := stateRunning
 	go func() {
@@ -281,7 +272,6 @@ func runFrontendDevWatcherCommand(frontendDirectory string, devCommand string, d
 
 // restartApp does the actual rebuilding of the application when files change
 func restartApp(buildOptions *build.Options, debugBinaryProcess *process.Process, f *flags.Dev, exitCodeChannel chan int, legacyUseDevServerInsteadofCustomScheme bool) (*process.Process, string, error) {
-
 	appBinary, err := build.Build(buildOptions)
 	println()
 	if err != nil {
@@ -308,7 +298,6 @@ func restartApp(buildOptions *build.Options, debugBinaryProcess *process.Process
 
 	// parse appargs if any
 	args, err := shlex.Split(f.AppArgs)
-
 	if err != nil {
 		buildOptions.Logger.Fatal("Unable to parse appargs: %s", err.Error())
 	}
@@ -337,9 +326,25 @@ func restartApp(buildOptions *build.Options, debugBinaryProcess *process.Process
 }
 
 // doWatcherLoop is the main watch loop that runs while dev is active
-func doWatcherLoop(buildOptions *build.Options, debugBinaryProcess *process.Process, f *flags.Dev, watcher *fsnotify.Watcher, exitCodeChannel chan int, quitChannel chan os.Signal, devServerURL *url.URL, legacyUseDevServerInsteadofCustomScheme bool) *process.Process {
+func doWatcherLoop(cwd string, buildOptions *build.Options, debugBinaryProcess *process.Process, f *flags.Dev, exitCodeChannel chan int, quitChannel chan os.Signal, devServerURL *url.URL, legacyUseDevServerInsteadofCustomScheme bool) (*process.Process, error) {
+	// create the project files watcher
+	watcher, err := initialiseWatcher(cwd)
+	if err != nil {
+		logutils.LogRed("Unable to create filesystem watcher. Reloads will not occur.")
+		return nil, err
+	}
+
+	defer func(watcher *fsnotify.Watcher) {
+		err := watcher.Close()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+	}(watcher)
+
+	logutils.LogGreen("Watching (sub)/directory: %s", cwd)
+
 	// Main Loop
-	var extensionsThatTriggerARebuild = sliceToMap(strings.Split(f.Extensions, ","))
+	extensionsThatTriggerARebuild := sliceToMap(strings.Split(f.Extensions, ","))
 	var dirsThatTriggerAReload []string
 	for _, dir := range strings.Split(f.ReloadDirs, ",") {
 		if dir == "" {
@@ -351,6 +356,12 @@ func doWatcherLoop(buildOptions *build.Options, debugBinaryProcess *process.Proc
 			continue
 		}
 		dirsThatTriggerAReload = append(dirsThatTriggerAReload, thePath)
+		err = watcher.Add(thePath)
+		if err != nil {
+			logutils.LogRed("Unable to watch path: %s due to error %v", thePath, err)
+		} else {
+			logutils.LogGreen("Watching (sub)/directory: %s", thePath)
+		}
 	}
 
 	quit := false
@@ -366,7 +377,7 @@ func doWatcherLoop(buildOptions *build.Options, debugBinaryProcess *process.Proc
 
 	assetDirURL := joinPath(devServerURL, "/wails/assetdir")
 	reloadURL := joinPath(devServerURL, "/wails/reload")
-	for quit == false {
+	for !quit {
 		// reload := false
 		select {
 		case exitCode := <-exitCodeChannel:
@@ -441,16 +452,21 @@ func doWatcherLoop(buildOptions *build.Options, debugBinaryProcess *process.Proc
 		case <-timer.C:
 			if rebuild {
 				rebuild = false
-				logutils.LogGreen("[Rebuild triggered] files updated")
-				// Try and build the app
-				newBinaryProcess, _, err := restartApp(buildOptions, debugBinaryProcess, f, exitCodeChannel, legacyUseDevServerInsteadofCustomScheme)
-				if err != nil {
-					logutils.LogRed("Error during build: %s", err.Error())
-					continue
-				}
-				// If we have a new process, saveConfig it
-				if newBinaryProcess != nil {
-					debugBinaryProcess = newBinaryProcess
+				if f.NoGoRebuild {
+					logutils.LogGreen("[Rebuild triggered] skipping due to flag -nogorebuild")
+				} else {
+					logutils.LogGreen("[Rebuild triggered] files updated")
+					// Try and build the app
+
+					newBinaryProcess, _, err := restartApp(buildOptions, debugBinaryProcess, f, exitCodeChannel, legacyUseDevServerInsteadofCustomScheme)
+					if err != nil {
+						logutils.LogRed("Error during build: %s", err.Error())
+						continue
+					}
+					// If we have a new process, saveConfig it
+					if newBinaryProcess != nil {
+						debugBinaryProcess = newBinaryProcess
+					}
 				}
 			}
 
@@ -494,7 +510,7 @@ func doWatcherLoop(buildOptions *build.Options, debugBinaryProcess *process.Proc
 			quit = true
 		}
 	}
-	return debugBinaryProcess
+	return debugBinaryProcess, nil
 }
 
 func joinPath(url *url.URL, subPath string) string {

@@ -26,19 +26,15 @@ type assetServerWebView struct {
 func (d *AssetServer) ServeWebViewRequest(req webview.Request) {
 	d.dispatchInit.Do(func() {
 		workers := d.dispatchWorkers
-		if workers == 0 {
-			workers = 10
+		if workers <= 0 {
+			return
 		}
 
 		workerC := make(chan webview.Request, workers*2)
 		for i := 0; i < workers; i++ {
 			go func() {
 				for req := range workerC {
-					uri, _ := req.URL()
 					d.processWebViewRequest(req)
-					if err := req.Close(); err != nil {
-						d.logError("Unable to call close for request for uri '%s'", uri)
-					}
 				}
 			}()
 		}
@@ -49,19 +45,38 @@ func (d *AssetServer) ServeWebViewRequest(req webview.Request) {
 		d.dispatchReqC = dispatchC
 	})
 
-	d.dispatchReqC <- req
+	if d.dispatchReqC == nil {
+		go d.processWebViewRequest(req)
+	} else {
+		d.dispatchReqC <- req
+	}
 }
 
-// processHTTPRequest processes the HTTP Request by faking a golang HTTP Server.
-// The request will be finished with a StatusNotImplemented code if no handler has written to the response.
 func (d *AssetServer) processWebViewRequest(r webview.Request) {
+	uri, _ := r.URL()
+	d.processWebViewRequestInternal(r)
+	if err := r.Close(); err != nil {
+		d.logError("Unable to call close for request for uri '%s'", uri)
+	}
+}
+
+// processWebViewRequestInternal processes the HTTP Request by faking a golang HTTP Server.
+// The request will be finished with a StatusNotImplemented code if no handler has written to the response.
+func (d *AssetServer) processWebViewRequestInternal(r webview.Request) {
+	uri := "unknown"
+	var err error
+
 	wrw := r.Response()
-	defer wrw.Finish()
+	defer func() {
+		if err := wrw.Finish(); err != nil {
+			d.logError("Error finishing request '%s': %s", uri, err)
+		}
+	}()
 
 	var rw http.ResponseWriter = &contentTypeSniffer{rw: wrw} // Make sure we have a Content-Type sniffer
 	defer rw.WriteHeader(http.StatusNotImplemented)           // This is a NOP when a handler has already written and set the status
 
-	uri, err := r.URL()
+	uri, err = r.URL()
 	if err != nil {
 		d.logError("Error processing request, unable to get URL: %s (HttpResponse=500)", err)
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -96,6 +111,18 @@ func (d *AssetServer) processWebViewRequest(r webview.Request) {
 		d.webviewRequestErrorHandler(uri, rw, fmt.Errorf("HTTP-Request: %w", err))
 		return
 	}
+
+	// For server requests, the URL is parsed from the URI supplied on the Request-Line as stored in RequestURI. For
+	// most requests, fields other than Path and RawQuery will be empty. (See RFC 7230, Section 5.3)
+	req.URL.Scheme = ""
+	req.URL.Host = ""
+	req.URL.Fragment = ""
+	req.URL.RawFragment = ""
+
+	if url := req.URL; req.RequestURI == "" && url != nil {
+		req.RequestURI = url.String()
+	}
+
 	req.Header = header
 
 	if req.RemoteAddr == "" {
@@ -103,14 +130,11 @@ func (d *AssetServer) processWebViewRequest(r webview.Request) {
 		req.RemoteAddr = "192.0.2.1:1234"
 	}
 
-	if req.RequestURI == "" && req.URL != nil {
-		req.RequestURI = req.URL.String()
-	}
-
 	if req.ContentLength == 0 {
-		req.ContentLength, _ = strconv.ParseInt(req.Header.Get(HeaderContentLength), 10, 64)
+		req.ContentLength = -1
 	} else {
-		req.Header.Set(HeaderContentLength, fmt.Sprintf("%d", req.ContentLength))
+		size := strconv.FormatInt(req.ContentLength, 10)
+		req.Header.Set(HeaderContentLength, size)
 	}
 
 	if host := req.Header.Get(HeaderHost); host != "" {

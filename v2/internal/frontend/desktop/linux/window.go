@@ -4,7 +4,9 @@
 package linux
 
 /*
-#cgo linux pkg-config: gtk+-3.0 webkit2gtk-4.0
+#cgo linux pkg-config: gtk+-3.0
+#cgo !webkit2_41 pkg-config: webkit2gtk-4.0
+#cgo webkit2_41 pkg-config: webkit2gtk-4.1
 
 #include <JavaScriptCore/JavaScript.h>
 #include <gtk/gtk.h>
@@ -25,6 +27,7 @@ import (
 	"github.com/wailsapp/wails/v2/internal/frontend"
 	"github.com/wailsapp/wails/v2/pkg/menu"
 	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
 )
 
 func gtkBool(input bool) C.gboolean {
@@ -37,11 +40,13 @@ func gtkBool(input bool) C.gboolean {
 type Window struct {
 	appoptions                               *options.App
 	debug                                    bool
+	devtoolsEnabled                          bool
 	gtkWindow                                unsafe.Pointer
 	contentManager                           unsafe.Pointer
 	webview                                  unsafe.Pointer
 	applicationMenu                          *menu.Menu
 	menubar                                  *C.GtkWidget
+	webviewBox                               *C.GtkWidget
 	vbox                                     *C.GtkWidget
 	accels                                   *C.GtkAccelGroup
 	minWidth, minHeight, maxWidth, maxHeight int
@@ -54,21 +59,27 @@ func bool2Cint(value bool) C.int {
 	return C.int(0)
 }
 
-func NewWindow(appoptions *options.App, debug bool) *Window {
+func NewWindow(appoptions *options.App, debug bool, devtoolsEnabled bool) *Window {
 	validateWebKit2Version(appoptions)
 
 	result := &Window{
-		appoptions: appoptions,
-		debug:      debug,
-		minHeight:  appoptions.MinHeight,
-		minWidth:   appoptions.MinWidth,
-		maxHeight:  appoptions.MaxHeight,
-		maxWidth:   appoptions.MaxWidth,
+		appoptions:      appoptions,
+		debug:           debug,
+		devtoolsEnabled: devtoolsEnabled,
+		minHeight:       appoptions.MinHeight,
+		minWidth:        appoptions.MinWidth,
+		maxHeight:       appoptions.MaxHeight,
+		maxWidth:        appoptions.MaxWidth,
 	}
 
 	gtkWindow := C.gtk_window_new(C.GTK_WINDOW_TOPLEVEL)
 	C.g_object_ref_sink(C.gpointer(gtkWindow))
 	result.gtkWindow = unsafe.Pointer(gtkWindow)
+
+	webviewName := C.CString("webview-box")
+	defer C.free(unsafe.Pointer(webviewName))
+	result.webviewBox = C.gtk_box_new(C.GTK_ORIENTATION_VERTICAL, 0)
+	C.gtk_widget_set_name(result.webviewBox, webviewName)
 
 	result.vbox = C.gtk_box_new(C.GTK_ORIENTATION_VERTICAL, 0)
 	C.gtk_container_add(result.asGTKContainer(), result.vbox)
@@ -82,6 +93,9 @@ func NewWindow(appoptions *options.App, debug bool) *Window {
 	var webviewGpuPolicy int
 	if appoptions.Linux != nil {
 		webviewGpuPolicy = int(appoptions.Linux.WebviewGpuPolicy)
+	} else {
+		// workaround for https://github.com/wailsapp/wails/issues/2977
+		webviewGpuPolicy = int(linux.WebviewGpuPolicyNever)
 	}
 
 	webview := C.SetupWebview(
@@ -89,15 +103,21 @@ func NewWindow(appoptions *options.App, debug bool) *Window {
 		result.asGTKWindow(),
 		bool2Cint(appoptions.HideWindowOnClose),
 		C.int(webviewGpuPolicy),
+		bool2Cint(appoptions.DragAndDrop != nil && appoptions.DragAndDrop.DisableWebViewDrop),
+		bool2Cint(appoptions.DragAndDrop != nil && appoptions.DragAndDrop.EnableFileDrop),
 	)
 	result.webview = unsafe.Pointer(webview)
 	buttonPressedName := C.CString("button-press-event")
 	defer C.free(unsafe.Pointer(buttonPressedName))
 	C.ConnectButtons(unsafe.Pointer(webview))
 
-	if debug {
-		C.DevtoolsEnabled(unsafe.Pointer(webview), C.int(1), C.bool(appoptions.Debug.OpenInspectorOnStartup))
-	} else {
+	if devtoolsEnabled {
+		C.DevtoolsEnabled(unsafe.Pointer(webview), C.int(1), C.bool(debug && appoptions.Debug.OpenInspectorOnStartup))
+		// Install Ctrl-Shift-F12 hotkey to call ShowInspector
+		C.InstallF12Hotkey(unsafe.Pointer(gtkWindow))
+	}
+
+	if !(debug || appoptions.EnableDefaultContextMenu) {
 		C.DisableContextMenu(unsafe.Pointer(webview))
 	}
 
@@ -108,7 +128,7 @@ func NewWindow(appoptions *options.App, debug bool) *Window {
 	// Setup window
 	result.SetKeepAbove(appoptions.AlwaysOnTop)
 	result.SetResizable(!appoptions.DisableResize)
-	result.SetSize(appoptions.Width, appoptions.Height)
+	result.SetDefaultSize(appoptions.Width, appoptions.Height)
 	result.SetDecorated(!appoptions.Frameless)
 	result.SetTitle(appoptions.Title)
 	result.SetMinSize(appoptions.MinWidth, appoptions.MinHeight)
@@ -171,7 +191,9 @@ func (w *Window) Center() {
 }
 
 func (w *Window) SetPosition(x int, y int) {
-	C.SetPosition(unsafe.Pointer(w.asGTKWindow()), C.int(x), C.int(y))
+	invokeOnMainThread(func() {
+		C.SetPosition(unsafe.Pointer(w.asGTKWindow()), C.int(x), C.int(y))
+	})
 }
 
 func (w *Window) Size() (int, int) {
@@ -261,12 +283,18 @@ func (w *Window) IsNormal() bool {
 }
 
 func (w *Window) SetBackgroundColour(r uint8, g uint8, b uint8, a uint8) {
+	windowIsTranslucent := false
+	if w.appoptions.Linux != nil && w.appoptions.Linux.WindowIsTranslucent {
+		windowIsTranslucent = true
+	}
 	data := C.RGBAOptions{
-		r:       C.uchar(r),
-		g:       C.uchar(g),
-		b:       C.uchar(b),
-		a:       C.uchar(a),
-		webview: w.webview,
+		r:                   C.uchar(r),
+		g:                   C.uchar(g),
+		b:                   C.uchar(b),
+		a:                   C.uchar(a),
+		webview:             w.webview,
+		webviewBox:          unsafe.Pointer(w.webviewBox),
+		windowIsTranslucent: gtkBool(windowIsTranslucent),
 	}
 	invokeOnMainThread(func() { C.SetBackgroundColour(unsafe.Pointer(&data)) })
 
@@ -283,7 +311,9 @@ func (w *Window) Run(url string) {
 	if w.menubar != nil {
 		C.gtk_box_pack_start(C.GTKBOX(unsafe.Pointer(w.vbox)), w.menubar, 0, 0, 0)
 	}
-	C.gtk_box_pack_start(C.GTKBOX(unsafe.Pointer(w.vbox)), C.GTKWIDGET(w.webview), 1, 1, 0)
+
+	C.gtk_box_pack_start(C.GTKBOX(unsafe.Pointer(w.webviewBox)), C.GTKWIDGET(w.webview), 1, 1, 0)
+	C.gtk_box_pack_start(C.GTKBOX(unsafe.Pointer(w.vbox)), w.webviewBox, 1, 1, 0)
 	_url := C.CString(url)
 	C.LoadIndex(w.webview, _url)
 	defer C.free(unsafe.Pointer(_url))
@@ -308,6 +338,10 @@ func (w *Window) SetKeepAbove(top bool) {
 
 func (w *Window) SetResizable(resizable bool) {
 	C.gtk_window_set_resizable(w.asGTKWindow(), gtkBool(resizable))
+}
+
+func (w *Window) SetDefaultSize(width int, height int) {
+	C.gtk_window_set_default_size(w.asGTKWindow(), C.int(width), C.int(height))
 }
 
 func (w *Window) SetSize(width int, height int) {
@@ -422,6 +456,10 @@ func (w *Window) ToggleMaximise() {
 	} else {
 		w.Maximise()
 	}
+}
+
+func (w *Window) ShowInspector() {
+	invokeOnMainThread(func() { C.ShowInspector(w.webview) })
 }
 
 // showModalDialogAndExit shows a modal dialog and exits the app.

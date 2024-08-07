@@ -16,7 +16,8 @@ import * as Window from "./window";
 import * as Screen from "./screen";
 import * as Browser from "./browser";
 import * as Clipboard from "./clipboard";
-
+import * as DragAndDrop from "./draganddrop";
+import * as ContextMenu from "./contextmenu";
 
 export function Quit() {
     window.WailsInvoke('Q');
@@ -41,6 +42,7 @@ window.runtime = {
     ...Browser,
     ...Screen,
     ...Clipboard,
+    ...DragAndDrop,
     EventsOn,
     EventsOnce,
     EventsOnMultiple,
@@ -61,7 +63,7 @@ window.wails = {
     callbacks,
     flags: {
         disableScrollbarDrag: false,
-        disableWailsDefaultContextMenu: false,
+        disableDefaultContextMenu: false,
         enableResize: false,
         defaultCursor: null,
         borderThickness: 6,
@@ -69,6 +71,9 @@ window.wails = {
         deferDragToMouseMove: true,
         cssDragProperty: "--wails-draggable",
         cssDragValue: "drag",
+        cssDropProperty: "--wails-drop-target",
+        cssDropValue: "drop",
+        enableWailsDragAndDrop: false,
     }
 };
 
@@ -78,10 +83,8 @@ if (window.wailsbindings) {
     delete window.wails.SetBindings;
 }
 
-// This is evaluated at build time in package.json
-// const dev = 0;
-// const production = 1;
-if (ENV === 1) {
+// (bool) This is evaluated at build time in package.json
+if (!DEBUG) {
     delete window.wailsbindings;
 }
 
@@ -113,8 +116,12 @@ window.wails.setCSSDragProperties = function (property, value) {
     window.wails.flags.cssDragValue = value;
 }
 
-window.addEventListener('mousedown', (e) => {
+window.wails.setCSSDropProperties = function (property, value) {
+    window.wails.flags.cssDropProperty = property;
+    window.wails.flags.cssDropValue = value;
+}
 
+window.addEventListener('mousedown', (e) => {
     // Check for resizing
     if (window.wails.flags.resizeEdge) {
         window.WailsInvoke("resize:" + window.wails.flags.resizeEdge);
@@ -189,8 +196,13 @@ window.addEventListener('mousemove', function (e) {
 
 // Setup context menu hook
 window.addEventListener('contextmenu', function (e) {
-    if (window.wails.flags.disableWailsDefaultContextMenu) {
+    // always show the contextmenu in debug & dev
+    if (DEBUG) return;
+
+    if (window.wails.flags.disableDefaultContextMenu) {
         e.preventDefault();
+    } else {
+        ContextMenu.processDefaultContextMenu(e);
     }
 });
 

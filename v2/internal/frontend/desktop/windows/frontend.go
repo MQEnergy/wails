@@ -7,11 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"runtime"
@@ -19,11 +16,12 @@ import (
 	"sync"
 	"text/template"
 	"time"
+	"unsafe"
 
 	"github.com/bep/debounce"
+	"github.com/wailsapp/go-webview2/pkg/edge"
 	"github.com/wailsapp/wails/v2/internal/binding"
 	"github.com/wailsapp/wails/v2/internal/frontend"
-	"github.com/wailsapp/wails/v2/internal/frontend/desktop/windows/go-webview2/pkg/edge"
 	"github.com/wailsapp/wails/v2/internal/frontend/desktop/windows/win32"
 	"github.com/wailsapp/wails/v2/internal/frontend/desktop/windows/winc"
 	"github.com/wailsapp/wails/v2/internal/frontend/desktop/windows/winc/w32"
@@ -31,11 +29,14 @@ import (
 	"github.com/wailsapp/wails/v2/internal/logger"
 	"github.com/wailsapp/wails/v2/internal/system/operatingsystem"
 	"github.com/wailsapp/wails/v2/pkg/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/assetserver/webview"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
 
 const startURL = "http://wails.localhost/"
+
+var secondInstanceBuffer = make(chan options.SecondInstanceData, 1)
 
 type Screen = frontend.Screen
 
@@ -48,6 +49,7 @@ type Frontend struct {
 	logger          *logger.Logger
 	chromium        *edge.Chromium
 	debug           bool
+	devtoolsEnabled bool
 
 	// Assets
 	assets   *assetserver.AssetServer
@@ -114,6 +116,8 @@ func NewFrontend(ctx context.Context, appoptions *options.App, myLogger *logger.
 	}
 	result.assets = assets
 
+	go result.startSecondInstanceProcessor()
+
 	return result
 }
 
@@ -138,12 +142,21 @@ func (f *Frontend) Run(ctx context.Context) error {
 
 	f.chromium = edge.NewChromium()
 
+	if f.frontendOptions.SingleInstanceLock != nil {
+		SetupSingleInstance(f.frontendOptions.SingleInstanceLock.UniqueId)
+	}
+
 	mainWindow := NewWindow(nil, f.frontendOptions, f.versionInfo, f.chromium)
 	f.mainWindow = mainWindow
 
 	var _debug = ctx.Value("debug")
+	var _devtoolsEnabled = ctx.Value("devtoolsEnabled")
+
 	if _debug != nil {
 		f.debug = _debug.(bool)
+	}
+	if _devtoolsEnabled != nil {
+		f.devtoolsEnabled = _devtoolsEnabled.(bool)
 	}
 
 	f.WindowCenter()
@@ -207,6 +220,7 @@ func (f *Frontend) WindowCenter() {
 
 func (f *Frontend) WindowSetAlwaysOnTop(b bool) {
 	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	f.mainWindow.SetAlwaysOnTop(b)
 }
 
@@ -419,6 +433,10 @@ func (f *Frontend) Quit() {
 	f.mainWindow.Invoke(winc.Exit)
 }
 
+func (f *Frontend) WindowPrint() {
+	f.ExecJS("window.print();")
+}
+
 func (f *Frontend) setupChromium() {
 	chromium := f.chromium
 
@@ -444,10 +462,29 @@ func (f *Frontend) setupChromium() {
 		chromium.AdditionalBrowserArgs = append(chromium.AdditionalBrowserArgs, arg)
 	}
 
+	if f.frontendOptions.DragAndDrop != nil && f.frontendOptions.DragAndDrop.DisableWebViewDrop {
+		if err := chromium.AllowExternalDrag(false); err != nil {
+			f.logger.Warning("WebView failed to set AllowExternalDrag to false!")
+		}
+	}
+
 	chromium.MessageCallback = f.processMessage
+	chromium.MessageWithAdditionalObjectsCallback = f.processMessageWithAdditionalObjects
 	chromium.WebResourceRequestedCallback = f.processRequest
 	chromium.NavigationCompletedCallback = f.navigationCompleted
 	chromium.AcceleratorKeyCallback = func(vkey uint) bool {
+		if vkey == w32.VK_F12 && f.devtoolsEnabled {
+			var keyState [256]byte
+			if w32.GetKeyboardState(keyState[:]) {
+				// Check if CTRL is pressed
+				if keyState[w32.VK_CONTROL]&0x80 != 0 && keyState[w32.VK_SHIFT]&0x80 != 0 {
+					chromium.OpenDevToolsWindow()
+					return true
+				}
+			} else {
+				f.logger.Error("Call to GetKeyboardState failed")
+			}
+		}
 		w32.PostMessage(f.mainWindow.Handle(), w32.WM_KEYDOWN, uintptr(vkey), 0)
 		return false
 	}
@@ -484,16 +521,24 @@ func (f *Frontend) setupChromium() {
 	}
 
 	chromium.Embed(f.mainWindow.Handle())
+
+	if chromium.HasCapability(edge.SwipeNavigation) {
+		swipeGesturesEnabled := f.frontendOptions.Windows != nil && f.frontendOptions.Windows.EnableSwipeGestures
+		err := chromium.PutIsSwipeNavigationEnabled(swipeGesturesEnabled)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	chromium.Resize()
 	settings, err := chromium.GetSettings()
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = settings.PutAreDefaultContextMenusEnabled(f.debug)
+	err = settings.PutAreDefaultContextMenusEnabled(f.debug || f.frontendOptions.EnableDefaultContextMenu)
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = settings.PutAreDevToolsEnabled(f.debug)
+	err = settings.PutAreDevToolsEnabled(f.devtoolsEnabled)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -506,6 +551,10 @@ func (f *Frontend) setupChromium() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		err = settings.PutIsPinchZoomEnabled(!opts.DisablePinchZoom)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	err = settings.PutIsStatusBarEnabled(false)
@@ -513,10 +562,6 @@ func (f *Frontend) setupChromium() {
 		log.Fatal(err)
 	}
 	err = settings.PutAreBrowserAcceleratorKeysEnabled(false)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = settings.PutIsSwipeNavigationEnabled(false)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -586,36 +631,31 @@ func (f *Frontend) processRequest(req *edge.ICoreWebView2WebResourceRequest, arg
 		return
 	}
 
-	rw := httptest.NewRecorder()
-	f.assets.ProcessHTTPRequestLegacy(rw, coreWebview2RequestToHttpRequest(req))
+	webviewRequest, err := webview.NewRequest(
+		f.chromium.Environment(),
+		args,
+		func(fn func()) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			if f.mainWindow.InvokeRequired() {
+				var wg sync.WaitGroup
+				wg.Add(1)
+				f.mainWindow.Invoke(func() {
+					fn()
+					wg.Done()
+				})
+				wg.Wait()
+			} else {
+				fn()
+			}
+		})
 
-	headers := []string{}
-	for k, v := range rw.Header() {
-		headers = append(headers, fmt.Sprintf("%s: %s", k, strings.Join(v, ",")))
-	}
-
-	code := rw.Code
-	if code == http.StatusNotModified {
-		// WebView2 has problems when a request returns a 304 status code and the WebView2 is going to hang for other
-		// requests including IPC calls.
-		f.logger.Error("%s: AssetServer returned 304 - StatusNotModified which are going to hang WebView2, changed code to 505 - StatusInternalServerError", uri)
-		code = http.StatusInternalServerError
-	}
-
-	env := f.chromium.Environment()
-	response, err := env.CreateWebResourceResponse(rw.Body.Bytes(), code, http.StatusText(code), strings.Join(headers, "\n"))
 	if err != nil {
-		f.logger.Error("CreateWebResourceResponse Error: %s", err)
+		f.logger.Error("%s: NewRequest failed: %s", uri, err)
 		return
 	}
-	defer response.Release()
 
-	// Send response back
-	err = args.PutResponse(response)
-	if err != nil {
-		f.logger.Error("PutResponse Error: %s", err)
-		return
-	}
+	f.assets.ServeWebViewRequest(webviewRequest)
 }
 
 var edgeMap = map[string]uintptr{
@@ -641,7 +681,15 @@ func (f *Frontend) processMessage(message string) {
 	}
 
 	if message == "runtime:ready" {
-		cmd := fmt.Sprintf("window.wails.setCSSDragProperties('%s', '%s');", f.frontendOptions.CSSDragProperty, f.frontendOptions.CSSDragValue)
+		cmd := fmt.Sprintf(
+			"window.wails.setCSSDragProperties('%s', '%s');\n"+
+				"window.wails.setCSSDropProperties('%s', '%s');",
+			f.frontendOptions.CSSDragProperty,
+			f.frontendOptions.CSSDragValue,
+			f.frontendOptions.DragAndDrop.CSSDropProperty,
+			f.frontendOptions.DragAndDrop.CSSDropValue,
+		)
+
 		f.ExecJS(cmd)
 		return
 	}
@@ -662,25 +710,81 @@ func (f *Frontend) processMessage(message string) {
 		return
 	}
 
-	go func() {
-		result, err := f.dispatcher.ProcessMessage(message, f)
-		if err != nil {
-			f.logger.Error(err.Error())
-			f.Callback(result)
+	go f.dispatchMessage(message)
+}
+
+func (f *Frontend) processMessageWithAdditionalObjects(message string, sender *edge.ICoreWebView2, args *edge.ICoreWebView2WebMessageReceivedEventArgs) {
+	if strings.HasPrefix(message, "file:drop") {
+		if !f.frontendOptions.DragAndDrop.EnableFileDrop {
 			return
 		}
-		if result == "" {
+		objs, err := args.GetAdditionalObjects()
+		if err != nil {
+			f.logger.Error(err.Error())
 			return
 		}
 
-		switch result[0] {
-		case 'c':
-			// Callback from a method call
-			f.Callback(result[1:])
-		default:
-			f.logger.Info("Unknown message returned from dispatcher: %+v", result)
+		defer objs.Release()
+
+		count, err := objs.GetCount()
+		if err != nil {
+			f.logger.Error(err.Error())
+			return
 		}
-	}()
+
+		files := make([]string, count)
+		for i := uint32(0); i < count; i++ {
+			_file, err := objs.GetValueAtIndex(i)
+			if err != nil {
+				f.logger.Error("cannot get value at %d : %s", i, err.Error())
+				return
+			}
+
+			file := (*edge.ICoreWebView2File)(unsafe.Pointer(_file))
+			defer file.Release()
+
+			filepath, err := file.GetPath()
+			if err != nil {
+				f.logger.Error("cannot get path for object at %d : %s", i, err.Error())
+				return
+			}
+
+			files[i] = filepath
+		}
+
+		var (
+			x = "0"
+			y = "0"
+		)
+		coords := strings.SplitN(message[10:], ":", 2)
+		if len(coords) == 2 {
+			x = coords[0]
+			y = coords[1]
+		}
+
+		go f.dispatchMessage(fmt.Sprintf("DD:%s:%s:%s", x, y, strings.Join(files, "\n")))
+		return
+	}
+}
+
+func (f *Frontend) dispatchMessage(message string) {
+	result, err := f.dispatcher.ProcessMessage(message, f)
+	if err != nil {
+		f.logger.Error(err.Error())
+		f.Callback(result)
+		return
+	}
+	if result == "" {
+		return
+	}
+
+	switch result[0] {
+	case 'c':
+		// Callback from a method call
+		f.Callback(result[1:])
+	default:
+		f.logger.Info("Unknown message returned from dispatcher: %+v", result)
+	}
 }
 
 func (f *Frontend) Callback(message string) {
@@ -724,6 +828,10 @@ func (f *Frontend) navigationCompleted(sender *edge.ICoreWebView2, args *edge.IC
 
 	if f.frontendOptions.Frameless && f.frontendOptions.DisableResize == false {
 		f.ExecJS("window.wails.flags.enableResize = true;")
+	}
+
+	if f.frontendOptions.DragAndDrop != nil && f.frontendOptions.DragAndDrop.EnableFileDrop {
+		f.ExecJS("window.wails.flags.enableWailsDragAndDrop = true;")
 	}
 
 	if f.hasStarted {
@@ -807,92 +915,11 @@ func (f *Frontend) onFocus(arg *winc.Event) {
 	f.chromium.Focus()
 }
 
-func coreWebview2RequestToHttpRequest(coreReq *edge.ICoreWebView2WebResourceRequest) func() (*http.Request, error) {
-	return func() (r *http.Request, err error) {
-		header := http.Header{}
-		headers, err := coreReq.GetHeaders()
-		if err != nil {
-			return nil, fmt.Errorf("GetHeaders Error: %s", err)
+func (f *Frontend) startSecondInstanceProcessor() {
+	for secondInstanceData := range secondInstanceBuffer {
+		if f.frontendOptions.SingleInstanceLock != nil &&
+			f.frontendOptions.SingleInstanceLock.OnSecondInstanceLaunch != nil {
+			f.frontendOptions.SingleInstanceLock.OnSecondInstanceLaunch(secondInstanceData)
 		}
-		defer headers.Release()
-
-		headersIt, err := headers.GetIterator()
-		if err != nil {
-			return nil, fmt.Errorf("GetIterator Error: %s", err)
-		}
-		defer headersIt.Release()
-
-		for {
-			has, err := headersIt.HasCurrentHeader()
-			if err != nil {
-				return nil, fmt.Errorf("HasCurrentHeader Error: %s", err)
-			}
-			if !has {
-				break
-			}
-
-			name, value, err := headersIt.GetCurrentHeader()
-			if err != nil {
-				return nil, fmt.Errorf("GetCurrentHeader Error: %s", err)
-			}
-
-			header.Set(name, value)
-			if _, err := headersIt.MoveNext(); err != nil {
-				return nil, fmt.Errorf("MoveNext Error: %s", err)
-			}
-		}
-
-		// WebView2 has problems when a request returns a 304 status code and the WebView2 is going to hang for other
-		// requests including IPC calls.
-		// So prevent 304 status codes by removing the headers that are used in combinationwith caching.
-		header.Del("If-Modified-Since")
-		header.Del("If-None-Match")
-
-		method, err := coreReq.GetMethod()
-		if err != nil {
-			return nil, fmt.Errorf("GetMethod Error: %s", err)
-		}
-
-		uri, err := coreReq.GetUri()
-		if err != nil {
-			return nil, fmt.Errorf("GetUri Error: %s", err)
-		}
-
-		var body io.ReadCloser
-		if content, err := coreReq.GetContent(); err != nil {
-			return nil, fmt.Errorf("GetContent Error: %s", err)
-		} else if content != nil {
-			body = &iStreamReleaseCloser{stream: content}
-		}
-
-		req, err := http.NewRequest(method, uri, body)
-		if err != nil {
-			if body != nil {
-				body.Close()
-			}
-			return nil, err
-		}
-		req.Header = header
-		return req, nil
 	}
-}
-
-type iStreamReleaseCloser struct {
-	stream *edge.IStream
-	closed bool
-}
-
-func (i *iStreamReleaseCloser) Read(p []byte) (int, error) {
-	if i.closed {
-		return 0, io.ErrClosedPipe
-	}
-	return i.stream.Read(p)
-}
-
-func (i *iStreamReleaseCloser) Close() error {
-	if i.closed {
-		return nil
-	}
-	i.closed = true
-	return i.stream.Release()
 }
