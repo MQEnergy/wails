@@ -83,10 +83,10 @@
   }
   function notifyListeners(eventData) {
     let eventName = eventData.name;
-    if (eventListeners[eventName]) {
-      const newEventListenerList = eventListeners[eventName].slice();
-      for (let count = eventListeners[eventName].length - 1; count >= 0; count -= 1) {
-        const listener = eventListeners[eventName][count];
+    const newEventListenerList = eventListeners[eventName]?.slice() || [];
+    if (newEventListenerList.length) {
+      for (let count = newEventListenerList.length - 1; count >= 0; count -= 1) {
+        const listener = newEventListenerList[count];
         let data = eventData.data;
         const destroy = listener.Callback(data);
         if (destroy) {
@@ -454,6 +454,7 @@
     if (!window.wails.flags.enableWailsDragAndDrop) {
       return;
     }
+    e.dataTransfer.dropEffect = 'copy';
     e.preventDefault();
     if (!flags.useDropTarget) {
       return;
